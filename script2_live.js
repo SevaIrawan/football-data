@@ -1,14 +1,17 @@
 /**
- * SCRIPT 2 LIVE — sync berkala: SCHEDULED↔LIVE↔FINISHED + skor dulu, stat menyusul
+ * SCRIPT 2 LIVE — sync berkala: SCHEDULED/LIVE → ESPN, lalu FINISHED setelah FT+10m
  * =============================================================================
- * Jalankan setelah `script2_update_results.js` manual sekali (beban awal).
+ * Jalankan setelah `script2_update_results.js` manual (data FINISHED / bolong = tugas manual).
  *
- * Aturan ringkas:
- * - Hanya baris yang liga-nya ada di season.config.js & tanggal dalam ESPN_DATES_RANGE.
- * - Skor dari ESPN scoreboard diprioritaskan; statistik dari ESPN summary.
- * - ESPN "in progress" → status Sheet LIVE; setelah FT tunggu 10 menit (file state)
- *   sambil tetap LIVE + sync penuh, lalu status FINISHED (statistik sempat stabil).
- * - Baris FINISHED tapi data bolong → dilengkapi seperti Script 2.
+ * Ruang lingkup (tidak mengutak-atik baris yang sudah FINISHED di Sheet):
+ * - Baris **FINISHED** di Sheet: dilewati seluruhnya (tidak fetch, tidak write).
+ * - **SCHEDULED**: hanya diproses jika **match_date = hari ini atau kemarin (GMT+7)** —
+ *   jadwal musim jauh di depan **dilewati** (tidak diurus LIVE). Sebelum kickoff lewat
+ *   → tidak menulis; ESPN live → sync real-time (skor dulu, lalu stat).
+ * - **LIVE** / transisi FT: ESPN selesai → tetap LIVE di Sheet sampai FT+10m (state file),
+ *   sync penuh, lalu FINISHED.
+ * - ESPN scoreboard: **hanya tanggal yang ada di Sheet** (hari ini & kemarin GMT+7), bukan
+ *   seluruh `ESPN_DATES_RANGE` musim — ikut jadwal Sheet, bukan “1200 event” musim.
  * - generate_video: auto-group sama seperti Script 2 (akhir run).
  *
  * Cara pakai:
@@ -33,6 +36,12 @@ const DEBUG_ESPN = process.env.DEBUG_ESPN === "1";
 
 const STATE_PATH = path.join(__dirname, "script2_live_state.json");
 const FT_POST_GRACE_MS = 10 * 60 * 1000;
+
+/** Jeda antar `values.update` ke Google Sheets (hindari quota "Write requests per minute per user"). */
+const SHEETS_WRITE_MIN_INTERVAL_MS = Math.max(
+  800,
+  parseInt(process.env.SHEETS_WRITE_MIN_INTERVAL_MS || "1300", 10) || 1300,
+);
 
 const SHEETS_DATE_EPOCH_UTC = Date.UTC(1899, 11, 30);
 const ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer";
@@ -267,20 +276,6 @@ function debugLog(...args) {
   if (DEBUG_ESPN) console.log(...args);
 }
 
-function isBlank(v) {
-  return v === null || v === undefined || String(v).trim() === "";
-}
-
-function shouldRefreshFinishedRow(row) {
-  return (
-    isBlank(row[COL.corners_home]) ||
-    isBlank(row[COL.corners_away]) ||
-    (isBlank(row[COL.home_goal_scorers]) && isBlank(row[COL.away_goal_scorers])) ||
-    isBlank(row[COL.home_league_rank]) ||
-    isBlank(row[COL.away_league_rank])
-  );
-}
-
 function sheetMatchStartUtcMs(row) {
   const ymd = parseMatchDateCell(row[COL.match_date]);
   const tod = formatKickoffForSheet(row[COL.kickoff]);
@@ -293,6 +288,13 @@ function sheetMatchStartUtcMs(row) {
   const iso = `${y}-${mo.padStart(2, "0")}-${da.padStart(2, "0")}T${hh}:${mm}:${ss}+07:00`;
   const t = Date.parse(iso);
   return Number.isNaN(t) ? null : t;
+}
+
+/** Kickoff Sheet (GMT+7) sudah lewat — untuk SCHEDULED jangan sync LIVE sebelum waktunya. */
+function sheetKickoffHasPassed(row) {
+  const t = sheetMatchStartUtcMs(row);
+  if (t == null) return true;
+  return Date.now() >= t;
 }
 
 function isEspnMatchCompleted(event) {
@@ -335,6 +337,61 @@ function rowDateInEspnRange(row) {
   const ymd = comparableMatchDateFromSheet(row[COL.match_date]);
   if (!ymd || ymd.length < 8) return false;
   return ymd >= r.startYmd && ymd <= r.endYmd;
+}
+
+/** Hari ini yyyy/mm/dd (GMT+7, sama seperti Sheet/kickoff). */
+function todayYmdGmt7() {
+  const gmt7 = new Date(Date.now() + 7 * 60 * 60 * 1000);
+  const y = gmt7.getUTCFullYear();
+  const mo = String(gmt7.getUTCMonth() + 1).padStart(2, "0");
+  const da = String(gmt7.getUTCDate()).padStart(2, "0");
+  return `${y}/${mo}/${da}`;
+}
+
+function ymdAddCalendarDays(ymd, deltaDays) {
+  const m = String(ymd || "").match(/^(\d{4})\/(\d{2})\/(\d{2})$/);
+  if (!m) return "";
+  const d = new Date(Date.UTC(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10)));
+  d.setUTCDate(d.getUTCDate() + deltaDays);
+  const y = d.getUTCFullYear();
+  const mo = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const da = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}/${mo}/${da}`;
+}
+
+/** SCHEDULED musim penuh tidak di-scan: cukup hari ini & kemarin (sisa FT kemarin). */
+function rowMatchDateIsTodayOrYesterdayGmt7(row) {
+  const rowY = comparableMatchDateFromSheet(row[COL.match_date]);
+  if (!rowY || !/^\d{4}\/\d{2}\/\d{2}$/.test(rowY)) return false;
+  const t = todayYmdGmt7();
+  return rowY === t || rowY === ymdAddCalendarDays(t, -1);
+}
+
+function ymdSlashToCompact(ymdSlash) {
+  const s = normalizeMatchDate(String(ymdSlash || "").trim());
+  if (!/^\d{4}\/\d{2}\/\d{2}$/.test(s)) return "";
+  return s.replace(/\//g, "");
+}
+
+/** Tanggal Sheet (yyyy/mm/dd) harus masuk musim `ESPN_DATES_RANGE`; else null. */
+function clampSheetYmdToSeason(ymdSlash) {
+  const r = parseEspnDatesRange(ESPN_DATES_RANGE);
+  const y = normalizeMatchDate(String(ymdSlash || "").trim());
+  if (!/^\d{4}\/\d{2}\/\d{2}$/.test(y)) return null;
+  if (!r) return y;
+  if (y < r.startYmd || y > r.endYmd) return null;
+  return y;
+}
+
+/** Hindari write ke Sheet kalau kolom status→rank tidak berubah (hemat kuota). */
+function rowMeaningfullyChanged(origRow, newRow) {
+  const n = Math.max(origRow?.length || 0, newRow?.length || 0, 35);
+  for (let i = COL.status; i <= COL.away_league_rank; i++) {
+    const a = i < (origRow?.length || 0) ? String(origRow[i] ?? "").trim() : "";
+    const b = i < (newRow?.length || 0) ? String(newRow[i] ?? "").trim() : "";
+    if (a !== b) return true;
+  }
+  return false;
 }
 
 function scoreFromCompetitor(c) {
@@ -460,22 +517,27 @@ async function updateRow(sheets, rowIndex, values) {
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [row] },
   });
+  await delay(SHEETS_WRITE_MIN_INTERVAL_MS);
   return row;
 }
 
 // ─── ESPN ──────────────────────────────────────────────────────────────────
 
-async function espnGetScoreboardEvents(espnCode) {
+/** Scoreboard **satu hari** (YYYYMMDD-YYYYMMDD sama) — dipanggil dari jadwal Sheet saja. */
+async function espnGetScoreboardEventsForDay(espnCode, ymdCompact8) {
   try {
     const url = `${ESPN_BASE}/${espnCode}/scoreboard`;
+    const d = String(ymdCompact8 || "").replace(/\D/g, "");
+    if (d.length !== 8) return [];
+    const datesParam = `${d}-${d}`;
     const response = await axios.get(url, {
       headers: ESPN_HEADERS,
-      params: { limit: 1000, dates: ESPN_DATES_RANGE },
+      params: { limit: 400, dates: datesParam },
       timeout: 20000,
     });
     return response.data?.events || [];
   } catch (error) {
-    console.error(`   ✗ ESPN scoreboard error: ${error.message}`);
+    console.error(`   ✗ ESPN scoreboard error (${espnCode} ${ymdCompact8}): ${error.message}`);
     return [];
   }
 }
@@ -784,12 +846,40 @@ async function main() {
   const leagueNames = new Set(COMPETITIONS.map((c) => c.name));
   let totalUpdated = 0;
 
-  for (const competition of COMPETITIONS) {
-    console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-    console.log(`📡 ${competition.name} (${competition.espn_code})`);
+  // ── Hanya tanggal dari Sheet (SCHEDULED/LIVE, hari ini & kemarin) → fetch scoreboard per hari ──
+  const fetchDayKeys = new Set();
+  for (let rowIndex = 0; rowIndex < allRows.length; rowIndex++) {
+    const orig = allRows[rowIndex];
+    const league = (orig[COL.league_name] || "").trim();
+    if (!leagueNames.has(league)) continue;
+    const competition = COMPETITIONS.find((c) => c.name === league);
+    if (!competition) continue;
+    if (!rowDateInEspnRange(orig)) continue;
 
-    const events = await espnGetScoreboardEvents(competition.espn_code);
-    const eventMap = new Map();
+    const sheetStatus = String(orig[COL.status] || "").trim().toUpperCase();
+    if (sheetStatus === "FINISHED") continue;
+    if (sheetStatus !== "SCHEDULED" && sheetStatus !== "LIVE") continue;
+    if (!rowMatchDateIsTodayOrYesterdayGmt7(orig)) continue;
+
+    const sheetDateClamped = clampSheetYmdToSeason(comparableMatchDateFromSheet(orig[COL.match_date]));
+    if (!sheetDateClamped) continue;
+    const compact = ymdSlashToCompact(sheetDateClamped);
+    if (compact.length !== 8) continue;
+    fetchDayKeys.add(`${competition.espn_code}\t${compact}`);
+  }
+
+  console.log(
+    `\n📅 ESPN scoreboard: ${fetchDayKeys.size} fetch (liga + 1 hari) dari jadwal Sheet (hari ini/kemarin GMT+7)`,
+  );
+
+  const globalEventMap = new Map();
+  const sortedFetchKeys = [...fetchDayKeys].sort();
+  for (const dk of sortedFetchKeys) {
+    const [espnCode, compact] = dk.split("\t");
+    const competition = COMPETITIONS.find((c) => c.espn_code === espnCode);
+    if (!competition) continue;
+    const events = await espnGetScoreboardEventsForDay(espnCode, compact);
+    await delay(400);
     for (const event of events) {
       const comp = event.competitions?.[0];
       const competitors = comp?.competitors || [];
@@ -800,132 +890,122 @@ async function main() {
       const awayNameEspn = awayTeam.team?.displayName || "";
       const eventDate = utcToGmt7Date(event.date || "");
       const key = makeRowMatchKey(competition.name, eventDate, homeNameEspn, awayNameEspn);
-      eventMap.set(key, { event, homeTeam, awayTeam });
+      globalEventMap.set(key, { event, homeTeam, awayTeam });
     }
-    console.log(`   ✓ ${eventMap.size} event di scoreboard (unik key)`);
+  }
+  console.log(`   ✓ ${globalEventMap.size} event di-cache (pasangan Sheet↔ESPN)\n`);
 
-    let compUpdated = 0;
+  for (let rowIndex = 0; rowIndex < allRows.length; rowIndex++) {
+    const orig = allRows[rowIndex];
+    const league = (orig[COL.league_name] || "").trim();
+    if (!leagueNames.has(league)) continue;
+    const competition = COMPETITIONS.find((c) => c.name === league);
+    if (!competition) continue;
+    if (!rowDateInEspnRange(orig)) continue;
 
-    for (let rowIndex = 0; rowIndex < allRows.length; rowIndex++) {
-      const orig = allRows[rowIndex];
-      const league = (orig[COL.league_name] || "").trim();
-      if (!leagueNames.has(league) || league !== competition.name) continue;
-      if (!rowDateInEspnRange(orig)) continue;
+    const sheetDate = comparableMatchDateFromSheet(orig[COL.match_date]);
+    const sheetStatus = String(orig[COL.status] || "").trim().toUpperCase();
 
-      const sheetDate = comparableMatchDateFromSheet(orig[COL.match_date]);
-      const sheetStatus = String(orig[COL.status] || "").trim().toUpperCase();
+    if (sheetStatus === "FINISHED") continue;
+    if (sheetStatus !== "SCHEDULED" && sheetStatus !== "LIVE") continue;
 
-      const rowKey = makeRowMatchKey(
-        league,
-        sheetDate,
-        orig[COL.home_name] || "",
-        orig[COL.away_name] || "",
+    if (sheetStatus === "SCHEDULED" && !rowMatchDateIsTodayOrYesterdayGmt7(orig)) continue;
+    if (sheetStatus === "LIVE" && !rowMatchDateIsTodayOrYesterdayGmt7(orig)) continue;
+
+    const rowKey = makeRowMatchKey(
+      league,
+      sheetDate,
+      orig[COL.home_name] || "",
+      orig[COL.away_name] || "",
+    );
+    const hit = globalEventMap.get(rowKey);
+    if (!hit) continue;
+
+    const { event, homeTeam, awayTeam } = hit;
+    const sk = stateKeyForEvent(competition.espn_code, event.id);
+    const espnDone = isEspnMatchCompleted(event);
+    const espnLive = isEspnLive(event);
+
+    if (!espnDone) {
+      delete liveState.completedFirstSeen[sk];
+    }
+
+    // ── ESPN belum selesai & tidak live: biarkan SCHEDULED (jangan paksa) ──
+    if (!espnDone && !espnLive) {
+      continue;
+    }
+
+    const row = [...orig];
+    while (row.length < 35) row.push("");
+
+    // ── LIVE (pertandingan berjalan) ──
+    if (espnLive) {
+      if (sheetStatus === "SCHEDULED" && !sheetKickoffHasPassed(orig)) continue;
+
+      applyScoresFromCompetitors(row, homeTeam, awayTeam);
+      const detail = await espnGetMatchDetail(competition.espn_code, event.id);
+      await delay(280);
+      if (detail) {
+        applyDetailToRow(row, detail, homeTeam, awayTeam, "LIVE");
+      } else {
+        row[COL.status] = "LIVE";
+      }
+      if (!rowMeaningfullyChanged(orig, row)) continue;
+      const written = await updateRow(sheets, rowIndex, row);
+      allRows[rowIndex] = written;
+      totalUpdated++;
+      console.log(
+        `   ▶ [${league}] LIVE ${row[COL.home_name]} ${row[COL.home_score]}-${row[COL.away_score]} ${row[COL.away_name]}`,
       );
-      const hit = eventMap.get(rowKey);
-      if (!hit) continue;
+      continue;
+    }
 
-      const { event, homeTeam, awayTeam } = hit;
-      const sk = stateKeyForEvent(competition.espn_code, event.id);
-      const espnDone = isEspnMatchCompleted(event);
-      const espnLive = isEspnLive(event);
-
-      if (!espnDone) {
-        delete liveState.completedFirstSeen[sk];
+    // ── ESPN FINISHED: jeda 10 menit sebelum label FINISHED di Sheet ──
+    if (espnDone) {
+      const now = Date.now();
+      if (!liveState.completedFirstSeen[sk]) {
+        liveState.completedFirstSeen[sk] = now;
       }
+      const firstSeen = liveState.completedFirstSeen[sk];
+      const waited = now - firstSeen;
 
-      // ── Sheet sudah FINISHED: hanya perbaiki data bolong ──
-      if (sheetStatus === "FINISHED") {
-        delete liveState.completedFirstSeen[sk];
-        if (!espnDone || !shouldRefreshFinishedRow(orig)) continue;
-        const detail = await espnGetMatchDetail(competition.espn_code, event.id);
-        await delay(280);
-        if (!detail) continue;
-        const row = [...orig];
-        applyDetailToRow(row, detail, homeTeam, awayTeam, "FINISHED");
-        const written = await updateRow(sheets, rowIndex, row);
-        allRows[rowIndex] = written;
-        totalUpdated++;
-        compUpdated++;
-        console.log(`   ⟳ Lengkap data FINISHED: ${row[COL.home_name]} vs ${row[COL.away_name]}`);
-        continue;
-      }
+      applyScoresFromCompetitors(row, homeTeam, awayTeam);
+      const detail = await espnGetMatchDetail(competition.espn_code, event.id);
+      await delay(280);
 
-      // ── ESPN belum selesai & tidak live: biarkan SCHEDULED (jangan paksa) ──
-      if (!espnDone && !espnLive) {
-        continue;
-      }
-
-      const row = [...orig];
-      while (row.length < 35) row.push("");
-
-      // ── LIVE (pertandingan berjalan) ──
-      if (espnLive) {
-        applyScoresFromCompetitors(row, homeTeam, awayTeam);
-        const detail = await espnGetMatchDetail(competition.espn_code, event.id);
-        await delay(280);
+      if (waited < FT_POST_GRACE_MS) {
         if (detail) {
           applyDetailToRow(row, detail, homeTeam, awayTeam, "LIVE");
         } else {
           row[COL.status] = "LIVE";
         }
-        const written = await updateRow(sheets, rowIndex, row);
-        allRows[rowIndex] = written;
-        totalUpdated++;
-        compUpdated++;
-        console.log(
-          `   ▶ LIVE ${row[COL.home_name]} ${row[COL.home_score]}-${row[COL.away_score]} ${row[COL.away_name]}`,
-        );
-        continue;
-      }
-
-      // ── ESPN FINISHED: jeda 10 menit sebelum label FINISHED di Sheet ──
-      if (espnDone) {
-        const now = Date.now();
-        if (!liveState.completedFirstSeen[sk]) {
-          liveState.completedFirstSeen[sk] = now;
-        }
-        const firstSeen = liveState.completedFirstSeen[sk];
-        const waited = now - firstSeen;
-
-        applyScoresFromCompetitors(row, homeTeam, awayTeam);
-        const detail = await espnGetMatchDetail(competition.espn_code, event.id);
-        await delay(280);
-
-        if (waited < FT_POST_GRACE_MS) {
-          if (detail) {
-            applyDetailToRow(row, detail, homeTeam, awayTeam, "LIVE");
-          } else {
-            row[COL.status] = "LIVE";
-          }
+        if (rowMeaningfullyChanged(orig, row)) {
           const written = await updateRow(sheets, rowIndex, row);
           allRows[rowIndex] = written;
           totalUpdated++;
-          compUpdated++;
           const secLeft = Math.ceil((FT_POST_GRACE_MS - waited) / 1000);
           console.log(
-            `   ⏳ FT window (${secLeft}s → FINISHED): ${row[COL.home_name]} ${row[COL.home_score]}-${row[COL.away_score]} ${row[COL.away_name]}`,
+            `   ⏳ [${league}] FT window (${secLeft}s → FINISHED): ${row[COL.home_name]} ${row[COL.home_score]}-${row[COL.away_score]} ${row[COL.away_name]}`,
           );
+        }
+      } else {
+        if (detail) {
+          applyDetailToRow(row, detail, homeTeam, awayTeam, "FINISHED");
         } else {
-          if (detail) {
-            applyDetailToRow(row, detail, homeTeam, awayTeam, "FINISHED");
-          } else {
-            applyScoresFromCompetitors(row, homeTeam, awayTeam);
-            row[COL.status] = "FINISHED";
-          }
-          delete liveState.completedFirstSeen[sk];
+          applyScoresFromCompetitors(row, homeTeam, awayTeam);
+          row[COL.status] = "FINISHED";
+        }
+        delete liveState.completedFirstSeen[sk];
+        if (rowMeaningfullyChanged(orig, row)) {
           const written = await updateRow(sheets, rowIndex, row);
           allRows[rowIndex] = written;
           totalUpdated++;
-          compUpdated++;
           console.log(
-            `   ✓ FINISHED ${row[COL.home_name]} ${row[COL.home_score]}-${row[COL.away_score]} ${row[COL.away_name]}`,
+            `   ✓ [${league}] FINISHED ${row[COL.home_name]} ${row[COL.home_score]}-${row[COL.away_score]} ${row[COL.away_name]}`,
           );
         }
       }
     }
-
-    console.log(`   📊 ${compUpdated} baris disentuh untuk ${competition.name}`);
-    await delay(1500);
   }
 
   saveLiveState(liveState);

@@ -30,6 +30,12 @@ const SHEET_NAME = "Result";
 const SHEET_SCAN_MAX_ROW = 50000;
 const DEBUG_ESPN = process.env.DEBUG_ESPN === "1";
 
+/** Jeda antar tulis ke Sheet (kuota Google: Write requests per minute per user). */
+const SHEETS_WRITE_MIN_INTERVAL_MS = Math.max(
+  800,
+  parseInt(process.env.SHEETS_WRITE_MIN_INTERVAL_MS || "1300", 10) || 1300,
+);
+
 /** Serial tanggal Google/Excel: hari sejak 30 Des 1899 (UTC). */
 const SHEETS_DATE_EPOCH_UTC = Date.UTC(1899, 11, 30);
 
@@ -398,6 +404,7 @@ async function updateRow(sheets, rowIndex, values) {
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [row] },
   });
+  await delay(SHEETS_WRITE_MIN_INTERVAL_MS);
   return row;
 }
 

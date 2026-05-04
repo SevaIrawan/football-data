@@ -102,6 +102,7 @@ node script2_live.js
 
 ### Rate limit & beban
 
+- **Google Sheets:** tiap baris yang di-update memakai satu **write** API. Ada batas **write per menit per user**; Script 2 dan Script 2 LIVE menambah jeda antar tulis (default ~1,3 s; bisa naikkan lewat `SHEETS_WRITE_MIN_INTERVAL_MS` di `.env`). Dulu bisa “cepat” lalu kena error — itu normal jika melewati kuota sesaat.
 - Banyak panggilan **ESPN summary** per run (tiap baris relevan). Interval scheduler jangan terlalu agresif bila banyak liga.
 - Script 2 (batch) tetap berguna untuk **menyapu** banyak FT sekaligus sebelum mengandalkan LIVE.
 
