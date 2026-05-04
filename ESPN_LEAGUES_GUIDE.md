@@ -41,9 +41,10 @@ Catatan:
 
 ## 4) Checklist setelah tambah liga
 
-1. Run `script1_fetch_schedule.js` -> pastikan tidak `400` untuk liga baru.
-2. Jika pakai Script3 (GW), cek apakah `fd_code` valid. Jika tidak, set `null`.
-3. Run `script2_update_results.js` untuk update hasil/stat saat match selesai.
+1. Run `script1_fetch_schedule.js` → pastikan tidak `400` untuk liga baru.
+2. Jika pakai Script 3 (GW), cek apakah `fd_code` valid. Jika tidak, set `null`.
+3. Run `script2_update_results.js` (manual/batch) untuk menyapu hasil **FINISHED** yang banyak sekaligus.
+4. Jika pakai **Script 2 LIVE** (`script2_live.js` / `run_script2_live.bat`), pastikan Task Scheduler memakai interval wajar (mis. 1–5 menit); LIVE mengikuti baris Sheet + `season.config.js`.
 
 ## 4b) Fallback manual GW (tanggal + tim)
 
@@ -330,11 +331,13 @@ ven.1 | Primera División de Venezuela
 
 - Beberapa code bisa terlihat mirip/duplikat di katalog ESPN (normal).
 - Tidak semua league code punya data untuk semua rentang tanggal.
-- Selalu test cepat dengan Script1 setelah tambah liga:
+- Selalu test cepat dengan Script 1 setelah tambah liga:
 
 ```bash
 node script1_fetch_schedule.js
 ```
 
 Jika dapat `400` untuk liga tertentu, berarti `espn_code` salah/unsupported untuk endpoint scoreboard.
+
+Untuk update hasil berkala (LIVE / FT+10m), lihat `script2_live.js` dan `README_SCRAPER.md`.
 

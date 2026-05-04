@@ -13,6 +13,9 @@ Thumbs.db
 .idea/
 .vscode/
 
+# Script 2 LIVE — waktu pertama deteksi FT (jangan commit)
+script2_live_state.json
+
 # Logs
 npm-debug.log*
 yarn-debug.log*

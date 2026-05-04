@@ -1,86 +1,84 @@
 /**
- * SCRIPT 2 — UPDATE RESULT, STATISTIK, KLASEMEN & SCORERS via ESPN API
- * ======================================================================
- * Source: 100% ESPN Hidden API (tanpa API key, gratis)
- * Data: skor, shots, possession, corners, fouls, cards, goal scorers, rank
+ * SCRIPT 2 LIVE — sync berkala: SCHEDULED↔LIVE↔FINISHED + skor dulu, stat menyusul
+ * =============================================================================
+ * Jalankan setelah `script2_update_results.js` manual sekali (beban awal).
+ *
+ * Aturan ringkas:
+ * - Hanya baris yang liga-nya ada di season.config.js & tanggal dalam ESPN_DATES_RANGE.
+ * - Skor dari ESPN scoreboard diprioritaskan; statistik dari ESPN summary.
+ * - ESPN "in progress" → status Sheet LIVE; setelah FT tunggu 10 menit (file state)
+ *   sambil tetap LIVE + sync penuh, lalu status FINISHED (statistik sempat stabil).
+ * - Baris FINISHED tapi data bolong → dilengkapi seperti Script 2.
+ * - generate_video: auto-group sama seperti Script 2 (akhir run).
  *
  * Cara pakai:
- * node script2_update_results.js
+ *   node script2_live.js
  *
- * Untuk sync berkala + status LIVE / jeda FT+10m gunakan `script2_live.js`
- * (lihat README_SCRAPER.md). Script ini tetap cocok untuk run manual/batch.
- *
- * Update hanya jika: ESPN menandai pertandingan selesai (completed / full time),
- * baris Sheet belum FINISHED, liga & tanggal & nama tim cocok, dan
- * waktu kickoff Sheet (GMT+7, sama seperti script1) sudah lewat ≥ 10 menit.
+ * State (gitignored): script2_live_state.json — waktu pertama mendeteksi FT per event ESPN.
  */
 
 require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
 const axios = require("axios");
 const { google } = require("googleapis");
 const { ESPN_DATES_RANGE, COMPETITIONS } = require("./season.config");
-
-// ─── CONFIG ────────────────────────────────────────────────────────────────
 
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, "\n");
 const SHEET_NAME = "Result";
-/** Sama seperti script1 — batas baris untuk baca data (hindari rentang tak terbatas). */
 const SHEET_SCAN_MAX_ROW = 50000;
 const DEBUG_ESPN = process.env.DEBUG_ESPN === "1";
 
-/** Serial tanggal Google/Excel: hari sejak 30 Des 1899 (UTC). */
-const SHEETS_DATE_EPOCH_UTC = Date.UTC(1899, 11, 30);
+const STATE_PATH = path.join(__dirname, "script2_live_state.json");
+const FT_POST_GRACE_MS = 10 * 60 * 1000;
 
+const SHEETS_DATE_EPOCH_UTC = Date.UTC(1899, 11, 30);
 const ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer";
 const ESPN_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-  "Accept": "application/json",
+  Accept: "application/json",
 };
 
-// Kolom index (0-based) — 35 kolom
 const COL = {
-  league_name:          0,
-  season:               1,
-  matchweek:            2,
-  match_date:           3,
-  kickoff:              4,
-  league_logo_url:      5,
-  league_logo_key:      6,
-  home_name:            7,
-  away_name:            8,
-  home_logo_url:        9,
-  away_logo_url:        10,
-  home_logo_key:        11,
-  away_logo_key:        12,
-  status:               13,
-  home_score:           14,
-  away_score:           15,
+  league_name: 0,
+  season: 1,
+  matchweek: 2,
+  match_date: 3,
+  kickoff: 4,
+  league_logo_url: 5,
+  league_logo_key: 6,
+  home_name: 7,
+  away_name: 8,
+  home_logo_url: 9,
+  away_logo_url: 10,
+  home_logo_key: 11,
+  away_logo_key: 12,
+  status: 13,
+  home_score: 14,
+  away_score: 15,
   shots_on_target_home: 16,
   shots_on_target_away: 17,
-  possession_home:      18,
-  possession_away:      19,
-  corners_home:         20,
-  corners_away:         21,
-  fouls_home:           22,
-  fouls_away:           23,
-  yellow_cards_home:    24,
-  yellow_cards_away:    25,
-  red_cards_home:       26,
-  red_cards_away:       27,
-  home_goal_scorers:    28,
-  away_goal_scorers:    29,
-  flashscore_url:       30,
-  generate_video:       31,
-  uploaded_at:          32,
-  home_league_rank:     33,
-  away_league_rank:     34,
+  possession_home: 18,
+  possession_away: 19,
+  corners_home: 20,
+  corners_away: 21,
+  fouls_home: 22,
+  fouls_away: 23,
+  yellow_cards_home: 24,
+  yellow_cards_away: 25,
+  red_cards_home: 26,
+  red_cards_away: 27,
+  home_goal_scorers: 28,
+  away_goal_scorers: 29,
+  flashscore_url: 30,
+  generate_video: 31,
+  uploaded_at: 32,
+  home_league_rank: 33,
+  away_league_rank: 34,
 };
 
-// ─── HELPER ────────────────────────────────────────────────────────────────
-
-/** Samakan format dengan script1 (yyyy/mm/dd) untuk bandingkan dengan isi Sheet. */
 function normalizeMatchDate(s) {
   const t = String(s || "").trim();
   const m = t.match(/^(\d{4})[/-](\d{2})[/-](\d{2})$/);
@@ -96,9 +94,6 @@ function serialDayToYmd(serialInt) {
   return `${y}/${mo}/${da}`;
 }
 
-/**
- * Ubah isi sel match_date (teks, serial angka, dd/mm/yyyy) → yyyy/mm/dd untuk compare & tulis ulang.
- */
 function parseMatchDateCell(v) {
   if (v === null || v === undefined || v === "") return null;
   if (typeof v === "number" && Number.isFinite(v)) {
@@ -127,9 +122,6 @@ function comparableMatchDateFromSheet(v) {
   return ymd || normalizeMatchDate(String(v || ""));
 }
 
-/**
- * Kickoff: pecahan hari (0–1), atau string hh:mm / hh:mm:ss → hh:mm:ss (GMT+7 dari script1).
- */
 function formatKickoffForSheet(v) {
   if (v === null || v === undefined || v === "") return "";
   const fromFraction = (frac) => {
@@ -172,9 +164,13 @@ function delay(ms) {
 }
 
 function normalizeName(name) {
-  return (name || "").toLowerCase().trim()
-    .replace(/fc$/i, "").replace(/^fc /i, "")
-    .replace(/\s+/g, " ").trim();
+  return (name || "")
+    .toLowerCase()
+    .trim()
+    .replace(/fc$/i, "")
+    .replace(/^fc /i, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function nameMatch(sheetName, espnName) {
@@ -182,7 +178,6 @@ function nameMatch(sheetName, espnName) {
   const e = normalizeName(espnName);
   if (s === e) return true;
   if (s.includes(e) || e.includes(s)) return true;
-  // Match kata utama (minimal 4 karakter)
   const words = e.split(" ").filter((w) => w.length >= 4);
   return words.some((w) => s.includes(w));
 }
@@ -241,10 +236,14 @@ function toOrdinal(n) {
   const v = x % 100;
   if (v >= 11 && v <= 13) return `${x}th`;
   switch (x % 10) {
-    case 1: return `${x}st`;
-    case 2: return `${x}nd`;
-    case 3: return `${x}rd`;
-    default: return `${x}th`;
+    case 1:
+      return `${x}st`;
+    case 2:
+      return `${x}nd`;
+    case 3:
+      return `${x}rd`;
+    default:
+      return `${x}th`;
   }
 }
 
@@ -256,7 +255,6 @@ function parseRankMapFromSummaryStandings(summaryData) {
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
       const rank = parseRankFromEntry(entry, i + 1);
-      // ESPN summary kadang team object, kadang string + id di level entry
       addRankAliases(rankMap, entry?.team || entry?.teamDisplayName || "", rank);
       if (entry?.id) rankMap[`id:${entry.id}`] = rank;
       if (entry?.uid) rankMap[`uid:${entry.uid}`] = rank;
@@ -269,10 +267,20 @@ function debugLog(...args) {
   if (DEBUG_ESPN) console.log(...args);
 }
 
-/** Jeda setelah kickoff (GMT+7, sama seperti script1) sebelum boleh pull hasil dari ESPN. */
-const KICKOFF_GRACE_MS = 10 * 60 * 1000;
+function isBlank(v) {
+  return v === null || v === undefined || String(v).trim() === "";
+}
 
-/** Parse match_date + kickoff Sheet → timestamp UTC (kickoff dianggap zona GMT+7). */
+function shouldRefreshFinishedRow(row) {
+  return (
+    isBlank(row[COL.corners_home]) ||
+    isBlank(row[COL.corners_away]) ||
+    (isBlank(row[COL.home_goal_scorers]) && isBlank(row[COL.away_goal_scorers])) ||
+    isBlank(row[COL.home_league_rank]) ||
+    isBlank(row[COL.away_league_rank])
+  );
+}
+
 function sheetMatchStartUtcMs(row) {
   const ymd = parseMatchDateCell(row[COL.match_date]);
   const tod = formatKickoffForSheet(row[COL.kickoff]);
@@ -287,12 +295,6 @@ function sheetMatchStartUtcMs(row) {
   return Number.isNaN(t) ? null : t;
 }
 
-function sheetKickoffGraceElapsed(row) {
-  const start = sheetMatchStartUtcMs(row);
-  if (start == null) return false;
-  return Date.now() >= start + KICKOFF_GRACE_MS;
-}
-
 function isEspnMatchCompleted(event) {
   const t = event.competitions?.[0]?.status?.type;
   if (!t) return false;
@@ -301,19 +303,49 @@ function isEspnMatchCompleted(event) {
   return n === "STATUS_FINAL" || n === "STATUS_FULL_TIME";
 }
 
-function isBlank(v) {
-  return v === null || v === undefined || String(v).trim() === "";
+function isEspnLive(event) {
+  if (isEspnMatchCompleted(event)) return false;
+  const t = event.competitions?.[0]?.status?.type;
+  if (!t) return false;
+  if (t.state === "in") return true;
+  const n = String(t.name || "");
+  if (
+    /STATUS_(IN_PROGRESS|HALFTIME|END_PERIOD|FIRST_HALF|SECOND_HALF|EXTRA|OVERTIME|SHOOTOUT)/i.test(
+      n,
+    )
+  ) {
+    return true;
+  }
+  const short = String(t.shortDetail || t.description || "").toLowerCase();
+  if (short.includes("live") || short.includes("ht") || short.includes("half")) return true;
+  return false;
 }
 
-function shouldRefreshFinishedRow(row) {
-  // Izinkan re-fetch untuk baris yang sudah FINISHED tapi masih ada celah data penting.
-  return (
-    isBlank(row[COL.corners_home]) ||
-    isBlank(row[COL.corners_away]) ||
-    (isBlank(row[COL.home_goal_scorers]) && isBlank(row[COL.away_goal_scorers])) ||
-    isBlank(row[COL.home_league_rank]) ||
-    isBlank(row[COL.away_league_rank])
-  );
+function parseEspnDatesRange(rangeStr) {
+  const m = String(rangeStr || "").trim().match(/^(\d{8})-(\d{8})$/);
+  if (!m) return null;
+  const toYmd = (compact) =>
+    `${compact.slice(0, 4)}/${compact.slice(4, 6)}/${compact.slice(6, 8)}`;
+  return { startYmd: toYmd(m[1]), endYmd: toYmd(m[2]) };
+}
+
+function rowDateInEspnRange(row) {
+  const r = parseEspnDatesRange(ESPN_DATES_RANGE);
+  if (!r) return true;
+  const ymd = comparableMatchDateFromSheet(row[COL.match_date]);
+  if (!ymd || ymd.length < 8) return false;
+  return ymd >= r.startYmd && ymd <= r.endYmd;
+}
+
+function scoreFromCompetitor(c) {
+  if (!c) return "";
+  const s = c.score;
+  if (s === undefined || s === null || s === "") return "";
+  if (typeof s === "object") {
+    const v = s.displayValue ?? s.value ?? s.summary;
+    if (v !== undefined && v !== null && v !== "") return String(v).trim();
+  }
+  return String(s).trim();
 }
 
 function pushUnique(arr, v) {
@@ -344,15 +376,20 @@ function bucketGoalEntry({
     pushUnique(awayScorers, entry);
     return;
   }
-  if (teamNameNorm && (teamNameNorm === homeNorm || homeNorm.includes(teamNameNorm) || teamNameNorm.includes(homeNorm))) {
+  if (
+    teamNameNorm &&
+    (teamNameNorm === homeNorm || homeNorm.includes(teamNameNorm) || teamNameNorm.includes(homeNorm))
+  ) {
     pushUnique(homeScorers, entry);
     return;
   }
-  if (teamNameNorm && (teamNameNorm === awayNorm || awayNorm.includes(teamNameNorm) || teamNameNorm.includes(awayNorm))) {
+  if (
+    teamNameNorm &&
+    (teamNameNorm === awayNorm || awayNorm.includes(teamNameNorm) || teamNameNorm.includes(awayNorm))
+  ) {
     pushUnique(awayScorers, entry);
     return;
   }
-  // Jika tim tidak bisa dipetakan dengan yakin, abaikan agar tidak salah isi scorer.
 }
 
 function toNonNegativeInt(v) {
@@ -363,6 +400,31 @@ function toNonNegativeInt(v) {
 function isGoalLikeType(typeValue) {
   const t = String(typeValue || "").toLowerCase();
   return t === "goal" || t === "own-goal" || t === "penalty-goal" || t === "penalty";
+}
+
+// ─── STATE (FT +10 menit) ─────────────────────────────────────────────────
+
+function loadLiveState() {
+  try {
+    const raw = fs.readFileSync(STATE_PATH, "utf8");
+    const j = JSON.parse(raw);
+    if (j && typeof j.completedFirstSeen === "object") return j;
+  } catch (_) {
+    /* missing or corrupt */
+  }
+  return { completedFirstSeen: {} };
+}
+
+function saveLiveState(state) {
+  try {
+    fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2), "utf8");
+  } catch (e) {
+    console.error("⚠️ Tidak bisa tulis script2_live_state.json:", e.message);
+  }
+}
+
+function stateKeyForEvent(espnCode, eventId) {
+  return `${espnCode}:${eventId}`;
 }
 
 // ─── GOOGLE SHEETS ─────────────────────────────────────────────────────────
@@ -401,31 +463,23 @@ async function updateRow(sheets, rowIndex, values) {
   return row;
 }
 
-// ─── ESPN API FUNCTIONS ────────────────────────────────────────────────────
+// ─── ESPN ──────────────────────────────────────────────────────────────────
 
-// 1. Fetch semua match FINISHED dari ESPN scoreboard
-async function espnGetFinishedMatches(espnCode) {
+async function espnGetScoreboardEvents(espnCode) {
   try {
     const url = `${ESPN_BASE}/${espnCode}/scoreboard`;
     const response = await axios.get(url, {
       headers: ESPN_HEADERS,
-      params: {
-        limit: 1000,
-        dates: ESPN_DATES_RANGE,
-      },
+      params: { limit: 1000, dates: ESPN_DATES_RANGE },
       timeout: 20000,
     });
-
-    const events = response.data?.events || [];
-    // ESPN pakai STATUS_FULL_TIME (liga Eropa), bukan hanya STATUS_FINAL
-    return events.filter(isEspnMatchCompleted);
+    return response.data?.events || [];
   } catch (error) {
     console.error(`   ✗ ESPN scoreboard error: ${error.message}`);
     return [];
   }
 }
 
-// 2. Fetch detail statistik + goal scorers dari ESPN summary
 async function espnGetMatchDetail(espnCode, eventId) {
   try {
     const url = `${ESPN_BASE}/${espnCode}/summary`;
@@ -446,8 +500,8 @@ async function espnGetMatchDetail(espnCode, eventId) {
     const awayName = awayTeam?.team?.displayName || awayTeam?.team?.name || "";
 
     const result = {
-      home_score: homeTeam?.score || "",
-      away_score: awayTeam?.score || "",
+      home_score: scoreFromCompetitor(homeTeam),
+      away_score: scoreFromCompetitor(awayTeam),
       home_logo_url: homeTeam?.team?.logo || homeTeam?.team?.logos?.[0]?.href || "",
       away_logo_url: awayTeam?.team?.logo || awayTeam?.team?.logos?.[0]?.href || "",
       shots_on_target_home: "",
@@ -471,53 +525,39 @@ async function espnGetMatchDetail(espnCode, eventId) {
       _debug_detail_goals: 0,
     };
 
-    // ── Statistik dari boxscore ──
     const teams = data.boxscore?.teams || [];
     for (const t of teams) {
       const isHome = t.homeAway === "home";
-      for (const stat of (t.statistics || [])) {
+      for (const stat of t.statistics || []) {
         const key = normalizeStatKey(stat.name || stat.displayName || stat.abbreviation || "");
         const val = statVal(stat);
         result._debug_stat_keys.push(`${t.homeAway || "?"}:${key}=${val}`);
         if (!val) continue;
 
         if (key.includes("shotsontarget") || key === "sot" || key.includes("shotsongoal")) {
-          isHome
-            ? (result.shots_on_target_home = val)
-            : (result.shots_on_target_away = val);
+          isHome ? (result.shots_on_target_home = val) : (result.shots_on_target_away = val);
         } else if (key.includes("possession")) {
           const num = parseFloat(val.replace("%", "")) || 0;
           const pct = num > 1 ? Math.round(num) : Math.round(num * 100);
-          isHome
-            ? (result.possession_home = pct)
-            : (result.possession_away = pct);
+          isHome ? (result.possession_home = pct) : (result.possession_away = pct);
         } else if (key.includes("corner")) {
-          isHome
-            ? (result.corners_home = val)
-            : (result.corners_away = val);
+          isHome ? (result.corners_home = val) : (result.corners_away = val);
         } else if (key.includes("foul")) {
-          isHome
-            ? (result.fouls_home = val)
-            : (result.fouls_away = val);
+          isHome ? (result.fouls_home = val) : (result.fouls_away = val);
         } else if (key.includes("yellowcard")) {
-          isHome
-            ? (result.yellow_cards_home = val)
-            : (result.yellow_cards_away = val);
+          isHome ? (result.yellow_cards_home = val) : (result.yellow_cards_away = val);
         } else if (key.includes("redcard")) {
-          isHome
-            ? (result.red_cards_home = val)
-            : (result.red_cards_away = val);
+          isHome ? (result.red_cards_home = val) : (result.red_cards_away = val);
         }
       }
     }
 
-    // ── Goal scorers dari scoring plays ──
     const homeId = homeTeam?.team?.id;
     const awayId = awayTeam?.team?.id;
     const homeScorers = [];
     const awayScorers = [];
 
-    for (const play of (data.scoringPlays || [])) {
+    for (const play of data.scoringPlays || []) {
       const teamId = play.team?.id;
       const teamDisplayName = play.team?.displayName || "";
       const athlete = play.athletesInvolved?.[0];
@@ -539,9 +579,8 @@ async function espnGetMatchDetail(espnCode, eventId) {
     }
     result._debug_scoring_plays = (data.scoringPlays || []).length;
 
-    // Fallback: beberapa match menyimpan catatan gol di details, bukan scoringPlays.
     if (homeScorers.length === 0 && awayScorers.length === 0) {
-      for (const d of (data.details || [])) {
+      for (const d of data.details || []) {
         const typeText = String(d?.type?.text || d?.type?.name || "").toLowerCase();
         const typeType = String(d?.type?.type || "").toLowerCase();
         const text = String(d?.text || d?.headline || "").trim();
@@ -551,9 +590,7 @@ async function espnGetMatchDetail(espnCode, eventId) {
         if (!text && !name) continue;
         if (!(isGoalLikeType(typeType) || /\bgoal\b/i.test(typeText))) continue;
         result._debug_detail_goals += 1;
-        const entry = name
-          ? (minute ? `${name} ${minute}'` : name)
-          : text;
+        const entry = name ? (minute ? `${name} ${minute}'` : name) : text;
         const teamId = d?.team?.id;
         const teamDisplayName = d?.team?.displayName || "";
         bucketGoalEntry({
@@ -570,10 +607,8 @@ async function espnGetMatchDetail(espnCode, eventId) {
       }
     }
 
-    // Fallback lanjut: banyak match 2025/26 tidak punya scoringPlays/details,
-    // tapi punya keyEvents dengan type=goal dan participants.
     if (homeScorers.length === 0 && awayScorers.length === 0) {
-      for (const ev of (data.keyEvents || [])) {
+      for (const ev of data.keyEvents || []) {
         const typeText = String(ev?.type?.text || ev?.type?.name || "").toLowerCase();
         const typeType = String(ev?.type?.type || "").toLowerCase();
         const text = String(ev?.text || ev?.shortText || "").trim();
@@ -583,9 +618,7 @@ async function espnGetMatchDetail(espnCode, eventId) {
         const p = ev?.participants?.[0]?.athlete;
         const name = p?.shortName || p?.displayName || "";
         const minute = ev?.clock?.displayValue || ev?.period?.displayValue || "";
-        const entry = name
-          ? (minute ? `${name} ${minute}'` : name)
-          : text;
+        const entry = name ? (minute ? `${name} ${minute}'` : name) : text;
         if (!entry) continue;
         bucketGoalEntry({
           homeScorers,
@@ -601,9 +634,8 @@ async function espnGetMatchDetail(espnCode, eventId) {
       }
     }
 
-    // Fallback terakhir: commentary hanya jika play.type benar-benar goal (hindari false-positive "goal kick").
     if (homeScorers.length === 0 && awayScorers.length === 0) {
-      for (const c of (data.commentary || [])) {
+      for (const c of data.commentary || []) {
         const p = c?.play;
         const typeText = String(p?.type?.text || p?.type?.type || "").toLowerCase();
         const typeType = String(p?.type?.type || "").toLowerCase();
@@ -612,9 +644,7 @@ async function espnGetMatchDetail(espnCode, eventId) {
         const athlete = p?.participants?.[0]?.athlete;
         const name = athlete?.shortName || athlete?.displayName || "";
         const minute = p?.clock?.displayValue || c?.time?.displayValue || "";
-        const entry = name
-          ? (minute ? `${name} ${minute}'` : name)
-          : text;
+        const entry = name ? (minute ? `${name} ${minute}'` : name) : text;
         if (!entry) continue;
         bucketGoalEntry({
           homeScorers,
@@ -630,7 +660,6 @@ async function espnGetMatchDetail(espnCode, eventId) {
       }
     }
 
-    // Guardrail final: jumlah scorer tidak boleh melebihi skor resmi.
     const homeGoals = toNonNegativeInt(result.home_score);
     const awayGoals = toNonNegativeInt(result.away_score);
     if (homeGoals === 0) homeScorers.length = 0;
@@ -641,8 +670,6 @@ async function espnGetMatchDetail(espnCode, eventId) {
     result.home_goal_scorers = homeScorers.join(", ");
     result.away_goal_scorers = awayScorers.join(", ");
 
-    // Rank ambil dari standings yang embed di summary event (lebih akurat untuk "setelah match").
-    // Jika tidak ada standings (mis. knockout tertentu), biarkan kosong.
     const rankMap = parseRankMapFromSummaryStandings(data);
     const homeRank =
       rankMap[`id:${homeTeam?.team?.id || ""}`] ||
@@ -660,52 +687,46 @@ async function espnGetMatchDetail(espnCode, eventId) {
   }
 }
 
-// 3. Fetch klasemen dari ESPN
-async function espnGetStandings(espnCode) {
-  try {
-    const url = `${ESPN_BASE}/${espnCode}/standings`;
-    const response = await axios.get(url, {
-      headers: ESPN_HEADERS,
-      params: { season: "2025" },
-      timeout: 20000,
-    });
-
-    const rankMap = {};
-    const containers = [];
-    const walk = (node) => {
-      if (!node) return;
-      if (Array.isArray(node)) {
-        for (const x of node) walk(x);
-        return;
-      }
-      if (typeof node !== "object") return;
-      if (Array.isArray(node.entries) && node.entries.some((e) => e?.team)) {
-        containers.push(node.entries);
-      }
-      for (const v of Object.values(node)) {
-        if (v && (Array.isArray(v) || typeof v === "object")) walk(v);
-      }
-    };
-    walk(response.data?.standings || response.data);
-
-    for (const entries of containers) {
-      for (let i = 0; i < entries.length; i++) {
-        const entry = entries[i];
-        const team = entry?.team;
-        if (!team) continue;
-        const rank = parseRankFromEntry(entry, i + 1);
-        addRankAliases(rankMap, team, rank);
-      }
-    }
-
-    return rankMap;
-  } catch (error) {
-    console.error(`   ✗ ESPN standings error: ${error.message}`);
-    return {};
-  }
+function applyScoresFromCompetitors(row, homeTeam, awayTeam) {
+  const hs = scoreFromCompetitor(homeTeam);
+  const as = scoreFromCompetitor(awayTeam);
+  if (hs !== "") row[COL.home_score] = hs;
+  if (as !== "") row[COL.away_score] = as;
 }
 
-// ─── AUTO GROUP VIDEO QUEUE ─────────────────────────────────────────────────
+function applyDetailToRow(row, detail, homeTeam, awayTeam, statusLabel) {
+  while (row.length < 35) row.push("");
+  row[COL.status] = statusLabel;
+  row[COL.home_score] =
+    detail?.home_score != null && detail.home_score !== ""
+      ? String(detail.home_score).trim()
+      : scoreFromCompetitor(homeTeam) || row[COL.home_score] || "";
+  row[COL.away_score] =
+    detail?.away_score != null && detail.away_score !== ""
+      ? String(detail.away_score).trim()
+      : scoreFromCompetitor(awayTeam) || row[COL.away_score] || "";
+
+  if (detail) {
+    row[COL.shots_on_target_home] = detail.shots_on_target_home || row[COL.shots_on_target_home] || "";
+    row[COL.shots_on_target_away] = detail.shots_on_target_away || row[COL.shots_on_target_away] || "";
+    row[COL.possession_home] = detail.possession_home || row[COL.possession_home] || "";
+    row[COL.possession_away] = detail.possession_away || row[COL.possession_away] || "";
+    row[COL.corners_home] = detail.corners_home || row[COL.corners_home] || "";
+    row[COL.corners_away] = detail.corners_away || row[COL.corners_away] || "";
+    row[COL.fouls_home] = detail.fouls_home || row[COL.fouls_home] || "";
+    row[COL.fouls_away] = detail.fouls_away || row[COL.fouls_away] || "";
+    row[COL.yellow_cards_home] = detail.yellow_cards_home || row[COL.yellow_cards_home] || "";
+    row[COL.yellow_cards_away] = detail.yellow_cards_away || row[COL.yellow_cards_away] || "";
+    row[COL.red_cards_home] = detail.red_cards_home || row[COL.red_cards_home] || "";
+    row[COL.red_cards_away] = detail.red_cards_away || row[COL.red_cards_away] || "";
+    row[COL.home_goal_scorers] = detail.home_goal_scorers || row[COL.home_goal_scorers] || "";
+    row[COL.away_goal_scorers] = detail.away_goal_scorers || row[COL.away_goal_scorers] || "";
+    row[COL.home_league_rank] = detail.home_league_rank || row[COL.home_league_rank] || "";
+    row[COL.away_league_rank] = detail.away_league_rank || row[COL.away_league_rank] || "";
+    if (!row[COL.home_logo_url] && detail.home_logo_url) row[COL.home_logo_url] = detail.home_logo_url;
+    if (!row[COL.away_logo_url] && detail.away_logo_url) row[COL.away_logo_url] = detail.away_logo_url;
+  }
+}
 
 async function autoGroupVideoQueue(sheets, allRows) {
   const pending = [];
@@ -739,166 +760,180 @@ async function autoGroupVideoQueue(sheets, allRows) {
   }
 }
 
+function makeRowMatchKey(leagueName, ymd, home, away) {
+  return `${String(leagueName).trim()}|${normalizeMatchDate(ymd)}|${normalizeName(home)}|${normalizeName(away)}`;
+}
+
 // ─── MAIN ──────────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log("🚀 Script 2 — Update via ESPN API (100%)");
-  console.log("==========================================");
-  if (DEBUG_ESPN) {
-    console.log("🐞 DEBUG_ESPN=1 aktif (log detail parser & alasan data kosong)");
-  }
+  console.log("🚀 Script 2 LIVE — ESPN sync berkala (LIVE + FT+10m)");
+  console.log("=====================================================");
+  if (DEBUG_ESPN) console.log("🐞 DEBUG_ESPN=1");
 
   if (!GOOGLE_SHEET_ID || !GOOGLE_SERVICE_ACCOUNT_EMAIL) {
     console.error("❌ Google credentials belum lengkap di .env");
     process.exit(1);
   }
 
-  console.log("\n🔗 Connecting ke Google Sheets...");
+  const liveState = loadLiveState();
   const sheets = await getSheets();
   const allRows = await getAllRows(sheets);
-  console.log(`   ✓ ${allRows.length} baris ditemukan`);
+  console.log(`   ✓ ${allRows.length} baris Sheet`);
 
-  // Debug sample baris pertama
-  if (allRows.length > 0) {
-    console.log(`\n🔍 Sample Sheet row 1:`);
-    console.log(`   match_date : "${allRows[0][COL.match_date]}"`);
-    console.log(`   home_name  : "${allRows[0][COL.home_name]}"`);
-    console.log(`   away_name  : "${allRows[0][COL.away_name]}"`);
-    console.log(`   status     : "${allRows[0][COL.status]}"`);
-  }
-
+  const leagueNames = new Set(COMPETITIONS.map((c) => c.name));
   let totalUpdated = 0;
 
   for (const competition of COMPETITIONS) {
     console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
     console.log(`📡 ${competition.name} (${competition.espn_code})`);
 
-    // 1. Ambil semua match FINISHED dari ESPN
-    console.log(`   Fetching finished matches...`);
-    const finishedMatches = await espnGetFinishedMatches(competition.espn_code);
-    console.log(`   ✓ ${finishedMatches.length} match FINISHED`);
-
-    if (finishedMatches.length === 0) {
-      await delay(2000);
-      continue;
-    }
-
-    // 2. Rank akan diambil per match dari summary.standings (setelah match)
-    console.log(`   Fetching rank from summary standings...`);
-
-    let compUpdated = 0;
-
-    // 3. Loop tiap match FINISHED — cari di Sheet dan update
-    for (const event of finishedMatches) {
+    const events = await espnGetScoreboardEvents(competition.espn_code);
+    const eventMap = new Map();
+    for (const event of events) {
       const comp = event.competitions?.[0];
       const competitors = comp?.competitors || [];
       const homeTeam = competitors.find((c) => c.homeAway === "home");
       const awayTeam = competitors.find((c) => c.homeAway === "away");
       if (!homeTeam || !awayTeam) continue;
-
       const homeNameEspn = homeTeam.team?.displayName || "";
       const awayNameEspn = awayTeam.team?.displayName || "";
-      const homeAbbrEspn = homeTeam.team?.abbreviation || "";
-      const awayAbbrEspn = awayTeam.team?.abbreviation || "";
       const eventDate = utcToGmt7Date(event.date || "");
+      const key = makeRowMatchKey(competition.name, eventDate, homeNameEspn, awayNameEspn);
+      eventMap.set(key, { event, homeTeam, awayTeam });
+    }
+    console.log(`   ✓ ${eventMap.size} event di scoreboard (unik key)`);
 
-      // Cari row di Sheet yang cocok (belum FINISHED, liga sama, tanggal sama, kickoff sudah lewat +10 menit)
-      const rowIndex = allRows.findIndex((row) => {
-        const isFinished = (row[COL.status] || "") === "FINISHED";
-        if (isFinished && !shouldRefreshFinishedRow(row)) return false;
-        if ((row[COL.league_name] || "").trim() !== competition.name) return false;
-        if (!sheetKickoffGraceElapsed(row)) return false;
-        if (comparableMatchDateFromSheet(row[COL.match_date]) !== normalizeMatchDate(eventDate)) return false;
-        return (
-          nameMatch(row[COL.home_name], homeNameEspn) &&
-          nameMatch(row[COL.away_name], awayNameEspn)
-        );
-      });
+    let compUpdated = 0;
 
-      if (rowIndex === -1) {
-        debugLog(
-          `   [DEBUG miss] ${competition.name} | ${eventDate} | ${homeNameEspn} vs ${awayNameEspn} | reason: row tidak match (league/date/name/kickoff+10m)`,
+    for (let rowIndex = 0; rowIndex < allRows.length; rowIndex++) {
+      const orig = allRows[rowIndex];
+      const league = (orig[COL.league_name] || "").trim();
+      if (!leagueNames.has(league) || league !== competition.name) continue;
+      if (!rowDateInEspnRange(orig)) continue;
+
+      const sheetDate = comparableMatchDateFromSheet(orig[COL.match_date]);
+      const sheetStatus = String(orig[COL.status] || "").trim().toUpperCase();
+
+      const rowKey = makeRowMatchKey(
+        league,
+        sheetDate,
+        orig[COL.home_name] || "",
+        orig[COL.away_name] || "",
+      );
+      const hit = eventMap.get(rowKey);
+      if (!hit) continue;
+
+      const { event, homeTeam, awayTeam } = hit;
+      const sk = stateKeyForEvent(competition.espn_code, event.id);
+      const espnDone = isEspnMatchCompleted(event);
+      const espnLive = isEspnLive(event);
+
+      if (!espnDone) {
+        delete liveState.completedFirstSeen[sk];
+      }
+
+      // ── Sheet sudah FINISHED: hanya perbaiki data bolong ──
+      if (sheetStatus === "FINISHED") {
+        delete liveState.completedFirstSeen[sk];
+        if (!espnDone || !shouldRefreshFinishedRow(orig)) continue;
+        const detail = await espnGetMatchDetail(competition.espn_code, event.id);
+        await delay(280);
+        if (!detail) continue;
+        const row = [...orig];
+        applyDetailToRow(row, detail, homeTeam, awayTeam, "FINISHED");
+        const written = await updateRow(sheets, rowIndex, row);
+        allRows[rowIndex] = written;
+        totalUpdated++;
+        compUpdated++;
+        console.log(`   ⟳ Lengkap data FINISHED: ${row[COL.home_name]} vs ${row[COL.away_name]}`);
+        continue;
+      }
+
+      // ── ESPN belum selesai & tidak live: biarkan SCHEDULED (jangan paksa) ──
+      if (!espnDone && !espnLive) {
+        continue;
+      }
+
+      const row = [...orig];
+      while (row.length < 35) row.push("");
+
+      // ── LIVE (pertandingan berjalan) ──
+      if (espnLive) {
+        applyScoresFromCompetitors(row, homeTeam, awayTeam);
+        const detail = await espnGetMatchDetail(competition.espn_code, event.id);
+        await delay(280);
+        if (detail) {
+          applyDetailToRow(row, detail, homeTeam, awayTeam, "LIVE");
+        } else {
+          row[COL.status] = "LIVE";
+        }
+        const written = await updateRow(sheets, rowIndex, row);
+        allRows[rowIndex] = written;
+        totalUpdated++;
+        compUpdated++;
+        console.log(
+          `   ▶ LIVE ${row[COL.home_name]} ${row[COL.home_score]}-${row[COL.away_score]} ${row[COL.away_name]}`,
         );
         continue;
       }
 
-      // 4. Fetch detail statistik dari ESPN summary
-      const detail = await espnGetMatchDetail(competition.espn_code, event.id);
-      await delay(300);
-      if (!detail) {
-        debugLog(`   [DEBUG detail] event ${event.id} summary kosong/error`);
-      }
+      // ── ESPN FINISHED: jeda 10 menit sebelum label FINISHED di Sheet ──
+      if (espnDone) {
+        const now = Date.now();
+        if (!liveState.completedFirstSeen[sk]) {
+          liveState.completedFirstSeen[sk] = now;
+        }
+        const firstSeen = liveState.completedFirstSeen[sk];
+        const waited = now - firstSeen;
 
-      const row = [...allRows[rowIndex]];
-      while (row.length < 35) row.push("");
+        applyScoresFromCompetitors(row, homeTeam, awayTeam);
+        const detail = await espnGetMatchDetail(competition.espn_code, event.id);
+        await delay(280);
 
-      // Update semua kolom
-      row[COL.status]               = "FINISHED";
-      row[COL.home_score]           = detail?.home_score || homeTeam.score || row[COL.home_score] || "";
-      row[COL.away_score]           = detail?.away_score || awayTeam.score || row[COL.away_score] || "";
-      row[COL.shots_on_target_home] = detail?.shots_on_target_home || row[COL.shots_on_target_home] || "";
-      row[COL.shots_on_target_away] = detail?.shots_on_target_away || row[COL.shots_on_target_away] || "";
-      row[COL.possession_home]      = detail?.possession_home || row[COL.possession_home] || "";
-      row[COL.possession_away]      = detail?.possession_away || row[COL.possession_away] || "";
-      row[COL.corners_home]         = detail?.corners_home || row[COL.corners_home] || "";
-      row[COL.corners_away]         = detail?.corners_away || row[COL.corners_away] || "";
-      row[COL.fouls_home]           = detail?.fouls_home || row[COL.fouls_home] || "";
-      row[COL.fouls_away]           = detail?.fouls_away || row[COL.fouls_away] || "";
-      row[COL.yellow_cards_home]    = detail?.yellow_cards_home || row[COL.yellow_cards_home] || "";
-      row[COL.yellow_cards_away]    = detail?.yellow_cards_away || row[COL.yellow_cards_away] || "";
-      row[COL.red_cards_home]       = detail?.red_cards_home || row[COL.red_cards_home] || "";
-      row[COL.red_cards_away]       = detail?.red_cards_away || row[COL.red_cards_away] || "";
-      row[COL.home_goal_scorers]    = detail?.home_goal_scorers || row[COL.home_goal_scorers] || "";
-      row[COL.away_goal_scorers]    = detail?.away_goal_scorers || row[COL.away_goal_scorers] || "";
-
-      // Update logo jika kosong
-      if (!row[COL.home_logo_url] && detail?.home_logo_url)
-        row[COL.home_logo_url] = detail.home_logo_url;
-      if (!row[COL.away_logo_url] && detail?.away_logo_url)
-        row[COL.away_logo_url] = detail.away_logo_url;
-
-      // Update league rank
-      row[COL.home_league_rank] = detail?.home_league_rank || row[COL.home_league_rank] || "";
-      row[COL.away_league_rank] = detail?.away_league_rank || row[COL.away_league_rank] || "";
-
-      if (DEBUG_ESPN) {
-        const missing = [];
-        if (!row[COL.corners_home] || !row[COL.corners_away]) missing.push("corners");
-        if (!row[COL.home_goal_scorers] && !row[COL.away_goal_scorers]) missing.push("scorers");
-        if (!row[COL.home_league_rank] || !row[COL.away_league_rank]) missing.push("rank");
-        if (missing.length > 0) {
-          console.log(
-            `   [DEBUG fields] event ${event.id} missing=${missing.join(",")} | scoringPlays=${detail?._debug_scoring_plays ?? 0} | detailGoals=${detail?._debug_detail_goals ?? 0}`,
-          );
-          if (detail?._debug_stat_keys?.length) {
-            console.log(`   [DEBUG stats] ${detail._debug_stat_keys.slice(0, 16).join(" | ")}`);
+        if (waited < FT_POST_GRACE_MS) {
+          if (detail) {
+            applyDetailToRow(row, detail, homeTeam, awayTeam, "LIVE");
+          } else {
+            row[COL.status] = "LIVE";
           }
+          const written = await updateRow(sheets, rowIndex, row);
+          allRows[rowIndex] = written;
+          totalUpdated++;
+          compUpdated++;
+          const secLeft = Math.ceil((FT_POST_GRACE_MS - waited) / 1000);
+          console.log(
+            `   ⏳ FT window (${secLeft}s → FINISHED): ${row[COL.home_name]} ${row[COL.home_score]}-${row[COL.away_score]} ${row[COL.away_name]}`,
+          );
+        } else {
+          if (detail) {
+            applyDetailToRow(row, detail, homeTeam, awayTeam, "FINISHED");
+          } else {
+            applyScoresFromCompetitors(row, homeTeam, awayTeam);
+            row[COL.status] = "FINISHED";
+          }
+          delete liveState.completedFirstSeen[sk];
+          const written = await updateRow(sheets, rowIndex, row);
+          allRows[rowIndex] = written;
+          totalUpdated++;
+          compUpdated++;
+          console.log(
+            `   ✓ FINISHED ${row[COL.home_name]} ${row[COL.home_score]}-${row[COL.away_score]} ${row[COL.away_name]}`,
+          );
         }
       }
-
-      // Tulis ke Sheet (match_date & kickoff dinormalisasi ke teks seperti script1)
-      const written = await updateRow(sheets, rowIndex, row);
-      allRows[rowIndex] = written;
-      totalUpdated++;
-      compUpdated++;
-
-      console.log(
-        `   ✓ ${row[COL.home_name]} ${row[COL.home_score]}-${row[COL.away_score]} ${row[COL.away_name]}` +
-        ` | shots: ${row[COL.shots_on_target_home]||"?"}-${row[COL.shots_on_target_away]||"?"}` +
-        ` | pos: ${row[COL.possession_home]||"?"}%-${row[COL.possession_away]||"?"}%`
-      );
     }
 
-    console.log(`   📊 ${compUpdated} match diupdate untuk ${competition.name}`);
-    await delay(2000);
+    console.log(`   📊 ${compUpdated} baris disentuh untuk ${competition.name}`);
+    await delay(1500);
   }
 
-  // Auto-group 6 match → YES
+  saveLiveState(liveState);
   await autoGroupVideoQueue(sheets, allRows);
 
-  console.log("\n==========================================");
-  console.log(`✅ Selesai! Total ${totalUpdated} match diupdate`);
-  console.log("==========================================\n");
+  console.log("\n=====================================================");
+  console.log(`✅ Script 2 LIVE selesai. Total baris di-update: ${totalUpdated}`);
+  console.log("=====================================================\n");
 }
 
 main().catch((err) => {

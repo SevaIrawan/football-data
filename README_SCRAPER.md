@@ -1,111 +1,140 @@
 # Football Sheet Viewer — Scraper Scripts
 
-## Dua Script Utama
+Ringkasan: **Script 1** isi jadwal ke Google Sheet; **Script 2** update hasil/stat untuk match **sudah selesai** (sekali / interval besar); **Script 2 LIVE** sync berkala untuk **LIVE**, **setelah FT +10 menit**, dan **data FINISHED yang terlewat**; **Script 3** isi matchweek dari football-data.org. Liga & rentang tanggal: **`season.config.js`**.
 
-### Script 1 — `script1_fetch_schedule.js`
-Ambil semua jadwal musim 2025/26 dari football-data.org dan tulis ke Google Sheet.
-- Liga: Premier League, Serie A, La Liga, Bundesliga, Ligue 1, Champions League
-- Jalankan SEKALI di awal musim (atau kapan pun mau refresh jadwal)
-- Output: semua match masuk ke Sheet dengan status = SCHEDULED, generate_video = PENDING
+---
 
-### Script 2 — `script2_update_results.js`
-Update skor, statistik, goal scorers, dan league rank untuk match yang sudah selesai.
-- Skor + goal scorers + rank → dari football-data.org (API resmi)
-- Statistik detail → dari FlashScore via Puppeteer scraping
-- Auto-group 6 match FINISHED → set generate_video = YES
-- Jalankan sebagai cron job tiap 10 menit
+## Script 1 — `script1_fetch_schedule.js`
+
+- **Sumber:** ESPN Hidden API (tanpa API key).
+- **Kapan:** sekali di awal musim atau saat perlu refresh jadwal.
+- **Output:** baris di Sheet dengan status **SCHEDULED**, `generate_video` = **PENDING** (sesuai logic script).
+
+```bash
+node script1_fetch_schedule.js
+```
+
+---
+
+## Script 2 — `script2_update_results.js`
+
+- **Sumber:** ESPN (scoreboard + summary) untuk skor, statistik, pencetak gol, rank dari standings di summary.
+- **Kapan:** jalankan **manual sekali** (atau sesekali) untuk menuntaskan banyak pertandingan **FINISHED** sekaligus — **disarankan sebelum** mengaktifkan Script 2 LIVE supaya beban awal ringan.
+- **Syarat baris:** liga & tanggal & nama tim cocok dengan ESPN; kickoff Sheet (GMT+7) sudah lewat **≥ 10 menit** sebelum diperlakukan sebagai calon update hasil (hindari false positive).
+- **Auto:** sampai 6 baris **FINISHED** + **PENDING** → `generate_video` = **YES** (satu batch).
+
+```bash
+node script2_update_results.js
+```
+
+---
+
+## Script 2 LIVE — `script2_live.js`
+
+- **Sumber:** sama seperti Script 2 (ESPN), mengikuti baris yang sudah ada di Sheet + `COMPETITIONS` + `ESPN_DATES_RANGE` di **`season.config.js`**.
+- **Kapan:** Task Scheduler Windows (atau cron) **setiap 1–5 menit** (sesuaikan beban); file launcher: **`run_script2_live.bat`** (tanpa `pause`, cocok scheduler).
+- **Perilaku utama:**
+  - ESPN match **sedang berjalan** → kolom **status** = **LIVE**, **skor** di-update dulu; lalu statistik dari summary menyusul.
+  - ESPN sudah **FT** → di Sheet tetap **LIVE** sampai **10 menit** setelah FT pertama kali terdeteksi (penyimpanan waktu di **`script2_live_state.json`**, di-gitignore); dalam jendela itu dilakukan **sync penuh** berulang; setelah itu **FINISHED** + data final.
+  - Baris sudah **FINISHED** tapi statistik masih bolong → dilengkapi (sama spirit “refresh” seperti Script 2).
+- **Auto:** `autoGroupVideoQueue` di akhir run (sama seperti Script 2).
+
+```bash
+node script2_live.js
+```
+
+**Urutan operasi disarankan:** `script2_update_results.js` (manual) → lalu aktifkan **Script 2 LIVE** terjadwal.
+
+---
+
+## Script 3 — `script3_update_matchweek.js`
+
+- **Sumber:** football-data.org untuk **matchday** / GW.
+- **`.env`:** butuh `FOOTBALL_DATA_API_KEY` (+ Google Sheet).
+
+```bash
+node script3_update_matchweek.js
+```
+
+---
+
+## Launcher `.bat` (Windows)
+
+| File | Fungsi |
+|------|--------|
+| `run_script1_fetch_schedule.bat` | Script 1 (ada `pause`) |
+| `run_script2_update_results.bat` | Script 2 manual (ada `pause`) |
+| `run_script2_live.bat` | Script 2 LIVE untuk scheduler (**tanpa** `pause`) |
+| `run_script3_update_matchweek.bat` | Script 3 (ada `pause`) |
+
+Untuk Task Scheduler: **Action** memanggil `run_script2_live.bat` atau `node.exe` dengan argumen path penuh ke `script2_live.js` dan **Start in** = folder repo.
 
 ---
 
 ## Setup
 
-### 1. Install dependencies
+### 1. Dependencies
+
 ```bash
-npm install axios googleapis dotenv puppeteer-extra puppeteer-extra-plugin-stealth
+npm install
 ```
 
-### 2. Isi .env
-Copy `.env.example` → `.env` dan isi semua nilai:
+### 2. `.env`
 
-```
-FOOTBALL_DATA_API_KEY=  → daftar di football-data.org (gratis)
-GOOGLE_SHEET_ID=        → ambil dari URL Google Sheet
-GOOGLE_SERVICE_ACCOUNT_EMAIL= → dari file JSON Service Account
-GOOGLE_PRIVATE_KEY=     → dari file JSON Service Account
-```
+Salin `.env.example` → `.env` dan isi (minimal untuk Script 1/2/2 LIVE):
 
-### 3. Jalankan Script 1 (sekali)
+- `GOOGLE_SHEET_ID`
+- `GOOGLE_SERVICE_ACCOUNT_EMAIL`
+- `GOOGLE_PRIVATE_KEY`
+
+Untuk **Script 3** saja tambahkan `FOOTBALL_DATA_API_KEY`.
+
+### 3. Opsional debug
+
 ```bash
-node script1_fetch_schedule.js
-```
-
-### 4. Setup Cron Job untuk Script 2 (tiap 10 menit)
-```bash
-# Edit crontab
-crontab -e
-
-# Tambah baris ini:
-*/10 * * * * node /path/to/script2_update_results.js >> /var/log/football-scraper.log 2>&1
+set DEBUG_ESPN=1
+node script2_live.js
 ```
 
 ---
 
-## Catatan Penting
+## Catatan penting
 
-### flashscore_url
-Script 2 butuh kolom `flashscore_url` diisi untuk bisa scraping statistik.
-Format: `https://www.flashscore.com/match/[team-a]-[team-b]/[match-id]/`
+### Rate limit & beban
 
-Untuk match yang sudah FINISHED tapi flashscore_url kosong:
-- Skor dan goal scorers tetap terupdate dari football-data.org
-- Statistik (shots, possession, dll) akan kosong
+- Banyak panggilan **ESPN summary** per run (tiap baris relevan). Interval scheduler jangan terlalu agresif bila banyak liga.
+- Script 2 (batch) tetap berguna untuk **menyapu** banyak FT sekaligus sebelum mengandalkan LIVE.
 
-### Rate Limit football-data.org
-Free tier: 10 request per menit.
-Script sudah handle dengan delay 6 detik antar liga.
+### `flashscore_url`
 
-### FlashScore Anti-Bot
-Script pakai puppeteer-extra dengan StealthPlugin untuk minimize risiko block.
-Jika tetap kena block, coba tambah delay di config scrapeFlashScoreStats().
+Kolom tetap ada di Sheet; **Script 2 / 2 LIVE saat ini tidak** mengisi statistik dari FlashScore (semua dari ESPN). Kolom bisa dipakai alur lain.
 
 ---
 
 ## Kolom Google Sheet (35 kolom)
 
-| No | Kolom | Diisi Oleh |
-|----|-------|------------|
+| No | Kolom | Diisi / di-update oleh |
+|----|-------|-------------------------|
 | 1 | league_name | Script 1 |
 | 2 | season | Script 1 |
-| 3 | matchweek | Script 1 |
+| 3 | matchweek | Script 1 / Script 3 |
 | 4 | match_date | Script 1 |
 | 5 | kickoff | Script 1 |
 | 6 | league_logo_url | Script 1 |
 | 7 | league_logo_key | Script 1 |
 | 8 | home_name | Script 1 |
 | 9 | away_name | Script 1 |
-| 10 | home_logo_url | Script 1 |
-| 11 | away_logo_url | Script 1 |
+| 10 | home_logo_url | Script 1 / Script 2 |
+| 11 | away_logo_url | Script 1 / Script 2 |
 | 12 | home_logo_key | Script 1 |
 | 13 | away_logo_key | Script 1 |
-| 14 | status | Script 1 (SCHEDULED) → Script 2 (FINISHED) |
-| 15 | home_score | Script 2 |
-| 16 | away_score | Script 2 |
-| 17 | shots_on_target_home | Script 2 (FlashScore) |
-| 18 | shots_on_target_away | Script 2 (FlashScore) |
-| 19 | possession_home | Script 2 (FlashScore) |
-| 20 | possession_away | Script 2 (FlashScore) |
-| 21 | corners_home | Script 2 (FlashScore) |
-| 22 | corners_away | Script 2 (FlashScore) |
-| 23 | fouls_home | Script 2 (FlashScore) |
-| 24 | fouls_away | Script 2 (FlashScore) |
-| 25 | yellow_cards_home | Script 2 (FlashScore) |
-| 26 | yellow_cards_away | Script 2 (FlashScore) |
-| 27 | red_cards_home | Script 2 (FlashScore) |
-| 28 | red_cards_away | Script 2 (FlashScore) |
-| 29 | home_goal_scorers | Script 2 (football-data.org) |
-| 30 | away_goal_scorers | Script 2 (football-data.org) |
-| 31 | flashscore_url | Manual (kamu isi) |
-| 32 | generate_video | PENDING → YES (Script 2 auto) → DONE (Next.js) |
-| 33 | uploaded_at | Next.js (setelah upload YouTube) |
-| 34 | home_league_rank | Script 2 |
-| 35 | away_league_rank | Script 2 |
+| 14 | status | Script 1 (**SCHEDULED**) → Script 2 LIVE (**LIVE** / **FINISHED**) → Script 2 (**FINISHED**) |
+| 15 | home_score | Script 2 / Script 2 LIVE |
+| 16 | away_score | Script 2 / Script 2 LIVE |
+| 17–28 | statistik & kartu & pencetak gol | Script 2 / Script 2 LIVE (ESPN summary) |
+| 31 | flashscore_url | Manual / alur lain |
+| 32 | generate_video | PENDING → YES (Script 2 / 2 LIVE) → DONE (Next.js) |
+| 33 | uploaded_at | Next.js |
+| 34–35 | home_league_rank, away_league_rank | Script 2 / Script 2 LIVE |
+
+*(Nomor kolom = urutan A–AI seperti range Sheet `A2:AI`.)*
