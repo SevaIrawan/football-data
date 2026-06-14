@@ -6,13 +6,11 @@
  */
 
 require("dotenv").config();
-const fs = require("fs");
-const path = require("path");
 const axios = require("axios");
 const { google } = require("googleapis");
 const { SEASON_LABEL, ESPN_DATES_RANGE, COMPETITIONS } = require("./season.config");
-
-// ─── CONFIG ────────────────────────────────────────────────────────────────
+const { COL, padRow, SHEET_COL_COUNT } = require("./sheet-columns");
+const { displayNameToLogoKey, loadLogoKeyOverrides } = require("./logo-key");
 
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
@@ -26,44 +24,6 @@ const ESPN_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
   "Accept": "application/json",
 };
-
-const LOGO_KEY_OVERRIDES_PATH = path.join(__dirname, "logo-key-overrides.json");
-
-/** Slug dari displayName ESPN → fallback Next.js bila URL logo kosong. */
-function loadLogoKeyOverrides() {
-  try {
-    if (!fs.existsSync(LOGO_KEY_OVERRIDES_PATH)) return {};
-    const raw = fs.readFileSync(LOGO_KEY_OVERRIDES_PATH, "utf8");
-    const o = JSON.parse(raw);
-    return o && typeof o === "object" && !Array.isArray(o) ? o : {};
-  } catch {
-    return {};
-  }
-}
-
-const LOGO_KEY_OVERRIDES = loadLogoKeyOverrides();
-
-/**
- * Nama tim (ESPN) → logo_key: huruf kecil, pemisah "-", tanpa token fc/cf/ss/sc,
- * "/" jadi "-". Cocokkan file opsional logo-key-overrides.json (slug → slug final).
- */
-function displayNameToLogoKey(displayName) {
-  const stripTokens = new Set(["fc", "cf", "ss", "sc"]);
-  let s = String(displayName || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\//g, "-")
-    .replace(/&/g, " and ")
-    .toLowerCase();
-
-  s = s.replace(/[^a-z0-9]+/g, " ").trim();
-  const parts = s.split(/\s+/).filter(Boolean).filter((w) => !stripTokens.has(w));
-  let slug = parts.join("-").replace(/-+/g, "-").replace(/^-|-$/g, "");
-  if (!slug) return "";
-
-  if (LOGO_KEY_OVERRIDES[slug]) return LOGO_KEY_OVERRIDES[slug];
-  return slug;
-}
 
 // ─── HELPER ────────────────────────────────────────────────────────────────
 
@@ -132,7 +92,7 @@ async function getExistingKeys(sheets) {
     const set = new Set();
     for (const row of rows) {
       if (!String(row[0] || "").trim()) continue;
-      const key = `${row[0]||""}|${normalizeMatchDateForKey(row[3])}|${row[7]||""}|${row[8]||""}`;
+      const key = `${row[0]||""}|${row[1]||""}|${normalizeMatchDateForKey(row[3])}|${row[7]||""}|${row[8]||""}`;
       set.add(key);
     }
     console.log(`   ✓ ${set.size} match sudah ada di Sheet`);
@@ -191,7 +151,7 @@ async function espnFetchAllMatches(espnCode) {
   }
 }
 
-// ─── TRANSFORM EVENT KE 35 KOLOM ──────────────────────────────────────────
+// ─── TRANSFORM EVENT KE KOLOM SHEET (A–AL) ────────────────────────────────
 
 function transformEvent(event, competition, fallbackLeagueLogoUrl = "") {
   try {
@@ -227,44 +187,28 @@ function transformEvent(event, competition, fallbackLeagueLogoUrl = "") {
 
     const homeScore = status === "FINISHED" ? (homeTeam.score || "") : "";
     const awayScore = status === "FINISHED" ? (awayTeam.score || "") : "";
+    const stadium = comp.venue?.fullName || "";
 
-    return [
-      competition.name,    // 1.  league_name
-      SEASON_LABEL,        // 2.  season
-      matchweek,           // 3.  matchweek
-      match_date,          // 4.  match_date
-      kickoff,             // 5.  kickoff
-      leagueLogo,          // 6.  league_logo_url
-      competition.logo_key,// 7.  league_logo_key
-      homeName,            // 8.  home_name
-      awayName,            // 9.  away_name
-      homeLogoUrl,         // 10. home_logo_url
-      awayLogoUrl,         // 11. away_logo_url
-      homeKey,             // 12. home_logo_key
-      awayKey,             // 13. away_logo_key
-      status,              // 14. status
-      homeScore,           // 15. home_score
-      awayScore,           // 16. away_score
-      "",                  // 17. shots_on_target_home
-      "",                  // 18. shots_on_target_away
-      "",                  // 19. possession_home
-      "",                  // 20. possession_away
-      "",                  // 21. corners_home
-      "",                  // 22. corners_away
-      "",                  // 23. fouls_home
-      "",                  // 24. fouls_away
-      "",                  // 25. yellow_cards_home
-      "",                  // 26. yellow_cards_away
-      "",                  // 27. red_cards_home
-      "",                  // 28. red_cards_away
-      "",                  // 29. home_goal_scorers
-      "",                  // 30. away_goal_scorers
-      "",                  // 31. flashscore_url
-      "PENDING",           // 32. generate_video
-      "",                  // 33. uploaded_at
-      "",                  // 34. home_league_rank
-      "",                  // 35. away_league_rank
-    ];
+    const row = new Array(SHEET_COL_COUNT).fill("");
+    row[COL.league_name] = competition.name;
+    row[COL.season] = SEASON_LABEL;
+    row[COL.matchweek] = matchweek;
+    row[COL.match_date] = match_date;
+    row[COL.kickoff] = kickoff;
+    row[COL.league_logo_url] = leagueLogo;
+    row[COL.league_logo_key] = competition.logo_key;
+    row[COL.home_name] = homeName;
+    row[COL.away_name] = awayName;
+    row[COL.home_logo_url] = homeLogoUrl;
+    row[COL.away_logo_url] = awayLogoUrl;
+    row[COL.home_logo_key] = homeKey;
+    row[COL.away_logo_key] = awayKey;
+    row[COL.status] = status;
+    row[COL.home_score] = homeScore;
+    row[COL.away_score] = awayScore;
+    row[COL.generate_video] = "PENDING";
+    row[COL.stadium] = stadium;
+    return padRow(row);
   } catch (e) {
     return null;
   }
@@ -275,7 +219,7 @@ function transformEvent(event, competition, fallbackLeagueLogoUrl = "") {
 async function main() {
   console.log("🚀 Script 1 — Fetch Jadwal via ESPN API");
   console.log("========================================");
-  const ovCount = Object.keys(LOGO_KEY_OVERRIDES).length;
+  const ovCount = Object.keys(loadLogoKeyOverrides()).length;
   if (ovCount) console.log(`   ℹ logo-key-overrides.json: ${ovCount} entri`);
 
   if (!GOOGLE_SHEET_ID || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY) {
@@ -309,8 +253,8 @@ async function main() {
       const row = transformEvent(event, competition, leagueLogoUrl);
       if (!row) { skipped++; continue; }
 
-      // Cek duplikat: league|date|home|away
-      const key = `${row[0]}|${normalizeMatchDateForKey(row[3])}|${row[7]}|${row[8]}`;
+      // Cek duplikat: league|season|date|home|away
+      const key = `${row[0]}|${row[1]}|${normalizeMatchDateForKey(row[3])}|${row[7]}|${row[8]}`;
       if (existing.has(key)) { skipped++; continue; }
 
       newRows.push(row);

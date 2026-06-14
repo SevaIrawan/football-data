@@ -1,6 +1,9 @@
 /**
- * Konfigurasi musim terpusat untuk Script 1/2/3.
- * Ubah di sini saat ganti musim/range/liga baru.
+ * Konfigurasi musim terpusat — SATU SUMBER untuk semua script (1–6).
+ * Tambah liga: cukup objek baru di COMPETITIONS, lalu jalankan run_pipeline_sync.bat
+ *
+ * Ubah musim: SEASON_LABEL + ESPN_DATES_RANGE. Data musim lama di Sheet tidak dihapus
+ * (Result append; Standings / Top_* merge per season; Standings_History append).
  */
 
 const SEASON_LABEL = "2025/26";
@@ -19,7 +22,7 @@ function getSeasonStartYear() {
 
 /**
  * Tambah liga baru cukup tambah objek di bawah.
- * - espn_code: untuk Script1/2 (ESPN)
+ * - espn_code: untuk Script1/2 (ESPN) & Script5 (klasemen)
  * - fd_code  : untuk Script3 (football-data.org, GW)
  * - logo_key : key logo liga di Sheet
  */

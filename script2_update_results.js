@@ -18,7 +18,13 @@
 require("dotenv").config();
 const axios = require("axios");
 const { google } = require("googleapis");
-const { ESPN_DATES_RANGE, COMPETITIONS } = require("./season.config");
+const { ESPN_DATES_RANGE, COMPETITIONS, SEASON_LABEL } = require("./season.config");
+const {
+  COL,
+  padRow,
+  sheetDataRange,
+  sheetRowRange,
+} = require("./sheet-columns");
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
 
@@ -45,46 +51,7 @@ const ESPN_HEADERS = {
   "Accept": "application/json",
 };
 
-// Kolom index (0-based) — 35 kolom
-const COL = {
-  league_name:          0,
-  season:               1,
-  matchweek:            2,
-  match_date:           3,
-  kickoff:              4,
-  league_logo_url:      5,
-  league_logo_key:      6,
-  home_name:            7,
-  away_name:            8,
-  home_logo_url:        9,
-  away_logo_url:        10,
-  home_logo_key:        11,
-  away_logo_key:        12,
-  status:               13,
-  home_score:           14,
-  away_score:           15,
-  shots_on_target_home: 16,
-  shots_on_target_away: 17,
-  possession_home:      18,
-  possession_away:      19,
-  corners_home:         20,
-  corners_away:         21,
-  fouls_home:           22,
-  fouls_away:           23,
-  yellow_cards_home:    24,
-  yellow_cards_away:    25,
-  red_cards_home:       26,
-  red_cards_away:       27,
-  home_goal_scorers:    28,
-  away_goal_scorers:    29,
-  flashscore_url:       30,
-  generate_video:       31,
-  uploaded_at:          32,
-  home_league_rank:     33,
-  away_league_rank:     34,
-};
-
-// ─── HELPER ────────────────────────────────────────────────────────────────
+// Kolom index — lihat sheet-columns.js (38 kolom A–AL)
 
 /** Samakan format dengan script1 (yyyy/mm/dd) untuk bandingkan dengan isi Sheet. */
 function normalizeMatchDate(s) {
@@ -318,7 +285,9 @@ function shouldRefreshFinishedRow(row) {
     isBlank(row[COL.corners_away]) ||
     (isBlank(row[COL.home_goal_scorers]) && isBlank(row[COL.away_goal_scorers])) ||
     isBlank(row[COL.home_league_rank]) ||
-    isBlank(row[COL.away_league_rank])
+    isBlank(row[COL.away_league_rank]) ||
+    isBlank(row[COL.news_update]) ||
+    isBlank(row[COL.stadium])
   );
 }
 
@@ -386,21 +355,20 @@ async function getSheets() {
 async function getAllRows(sheets) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: GOOGLE_SHEET_ID,
-    range: `${SHEET_NAME}!A2:AI${SHEET_SCAN_MAX_ROW}`,
+    range: sheetDataRange(SHEET_SCAN_MAX_ROW, SHEET_NAME),
   });
   return res.data.values || [];
 }
 
 async function updateRow(sheets, rowIndex, values) {
   const sheetRow = rowIndex + 2;
-  const row = [...values];
-  while (row.length < 35) row.push("");
+  const row = padRow(values);
   const md = parseMatchDateCell(row[COL.match_date]);
   if (md) row[COL.match_date] = md;
   row[COL.kickoff] = formatKickoffForSheet(row[COL.kickoff]);
   await sheets.spreadsheets.values.update({
     spreadsheetId: GOOGLE_SHEET_ID,
-    range: `${SHEET_NAME}!A${sheetRow}:AI${sheetRow}`,
+    range: sheetRowRange(sheetRow, SHEET_NAME),
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [row] },
   });
@@ -473,6 +441,8 @@ async function espnGetMatchDetail(espnCode, eventId) {
       away_goal_scorers: "",
       home_league_rank: "",
       away_league_rank: "",
+      news_update: "",
+      stadium: "",
       _debug_stat_keys: [],
       _debug_scoring_plays: 0,
       _debug_detail_goals: 0,
@@ -660,6 +630,11 @@ async function espnGetMatchDetail(espnCode, eventId) {
     result.home_league_rank = toOrdinal(homeRank);
     result.away_league_rank = toOrdinal(awayRank);
 
+    result.news_update = String(data.article?.headline || "").trim();
+    result.stadium = String(
+      data.gameInfo?.venue?.fullName || comp?.venue?.fullName || "",
+    ).trim();
+
     return result;
   } catch (error) {
     console.error(`   ✗ ESPN summary error event ${eventId}: ${error.message}`);
@@ -732,8 +707,7 @@ async function autoGroupVideoQueue(sheets, allRows) {
     const batch = pending.slice(0, 6);
     console.log(`\n🎬 Auto-set ${batch.length} match → generate_video = YES`);
     for (const item of batch) {
-      const r = [...item.row];
-      while (r.length < 35) r.push("");
+      const r = padRow(item.row);
       r[COL.generate_video] = "YES";
       const written = await updateRow(sheets, item.index, r);
       allRows[item.index] = written;
@@ -814,6 +788,7 @@ async function main() {
         const isFinished = (row[COL.status] || "") === "FINISHED";
         if (isFinished && !shouldRefreshFinishedRow(row)) return false;
         if ((row[COL.league_name] || "").trim() !== competition.name) return false;
+        if (String(row[COL.season] || "").trim() !== SEASON_LABEL) return false;
         if (!sheetKickoffGraceElapsed(row)) return false;
         if (comparableMatchDateFromSheet(row[COL.match_date]) !== normalizeMatchDate(eventDate)) return false;
         return (
@@ -836,8 +811,7 @@ async function main() {
         debugLog(`   [DEBUG detail] event ${event.id} summary kosong/error`);
       }
 
-      const row = [...allRows[rowIndex]];
-      while (row.length < 35) row.push("");
+      const row = padRow(allRows[rowIndex]);
 
       // Update semua kolom
       row[COL.status]               = "FINISHED";
@@ -867,6 +841,8 @@ async function main() {
       // Update league rank
       row[COL.home_league_rank] = detail?.home_league_rank || row[COL.home_league_rank] || "";
       row[COL.away_league_rank] = detail?.away_league_rank || row[COL.away_league_rank] || "";
+      if (detail?.news_update) row[COL.news_update] = detail.news_update;
+      if (!row[COL.stadium] && detail?.stadium) row[COL.stadium] = detail.stadium;
 
       if (DEBUG_ESPN) {
         const missing = [];

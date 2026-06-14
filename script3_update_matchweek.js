@@ -18,6 +18,7 @@ const path = require("path");
 const axios = require("axios");
 const { google } = require("googleapis");
 const { COMPETITIONS } = require("./season.config");
+const { COL, sheetDataRange } = require("./sheet-columns");
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
 
@@ -92,18 +93,7 @@ const TEAM_ALIASES = {
   "bayer 04 leverkusen": "bayer leverkusen",
 };
 
-// Kolom index 0-based mengikuti schema sekarang
-const COL = {
-  league_name: 0, // A
-  season: 1, // B
-  matchweek: 2, // C
-  match_date: 3, // D
-  kickoff: 4, // E
-  home_name: 7, // H
-  away_name: 8, // I
-  home_logo_key: 11, // L
-  away_logo_key: 12, // M
-};
+// Kolom index — lihat sheet-columns.js (matchweek = kolom C)
 
 // ─── HELPER ────────────────────────────────────────────────────────────────
 
@@ -357,7 +347,7 @@ async function getSheets() {
 async function getAllRows(sheets) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: GOOGLE_SHEET_ID,
-    range: `${SHEET_NAME}!A2:AI${SHEET_SCAN_MAX_ROW}`,
+    range: sheetDataRange(SHEET_SCAN_MAX_ROW, SHEET_NAME),
   });
   return res.data.values || [];
 }
