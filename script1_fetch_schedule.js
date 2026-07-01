@@ -103,13 +103,57 @@ async function getExistingKeys(sheets) {
   }
 }
 
+/** Perluas grid tab Result jika baris tulis melebihi batas Sheet saat ini. */
+async function ensureSheetRowCapacity(sheets, minRow1Based) {
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    fields: "sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))",
+  });
+  const sheet = (meta.data.sheets || []).find((s) => s.properties?.title === SHEET_NAME);
+  if (!sheet) throw new Error(`Tab "${SHEET_NAME}" tidak ditemukan`);
+
+  const sheetId = sheet.properties.sheetId;
+  const grid = sheet.properties.gridProperties || {};
+  const currentRows = grid.rowCount || 1000;
+  const currentCols = grid.columnCount || 26;
+  const requests = [];
+
+  if (minRow1Based > currentRows) {
+    const add = minRow1Based - currentRows;
+    requests.push({
+      appendDimension: { sheetId, dimension: "ROWS", length: add },
+    });
+  }
+  if (SHEET_COL_COUNT > currentCols) {
+    requests.push({
+      appendDimension: {
+        sheetId,
+        dimension: "COLUMNS",
+        length: SHEET_COL_COUNT - currentCols,
+      },
+    });
+  }
+
+  if (!requests.length) return;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    requestBody: { requests },
+  });
+  const parts = [];
+  if (minRow1Based > currentRows) parts.push(`+${minRow1Based - currentRows} baris`);
+  if (SHEET_COL_COUNT > currentCols) parts.push(`kolom → ${SHEET_COL_COUNT}`);
+  console.log(`   ℹ Tab ${SHEET_NAME} diperluas (${parts.join(", ")})`);
+}
+
 async function writeRowsBatch(sheets, rows) {
   if (!rows.length) return;
 
-  // Pakai update ke baris kosong pertama (kolom A), bukan append — append sering melompat
-  // ke bawah jika ada sel/format di baris jauh atau “table” Sheets terdeteksi salah.
   const BATCH = 500;
   let startRow = await getFirstWriteRow(sheets);
+  const totalEndRow = startRow + rows.length - 1;
+  // Buffer ekstra agar musim baru tidak kena limit lagi terlalu cepat
+  await ensureSheetRowCapacity(sheets, totalEndRow + 2000);
 
   for (let i = 0; i < rows.length; i += BATCH) {
     const chunk = rows.slice(i, i + BATCH);
