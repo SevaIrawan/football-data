@@ -18,7 +18,7 @@
 require("dotenv").config();
 const axios = require("axios");
 const { google } = require("googleapis");
-const { ESPN_DATES_RANGE, COMPETITIONS, SEASON_LABEL } = require("./season.config");
+const { ESPN_DATES_RANGE, COMPETITIONS, SEASON_LABEL, getSeasonStartYear } = require("./season.config");
 const {
   COL,
   padRow,
@@ -648,7 +648,7 @@ async function espnGetStandings(espnCode) {
     const url = `${ESPN_BASE}/${espnCode}/standings`;
     const response = await axios.get(url, {
       headers: ESPN_HEADERS,
-      params: { season: "2025" },
+      params: { season: String(getSeasonStartYear()) },
       timeout: 20000,
     });
 

@@ -6,18 +6,18 @@
  * (Result append; Standings / Top_* merge per season; Standings_History append).
  */
 
-const SEASON_LABEL = "2025/26";
-const ESPN_DATES_RANGE = "20250801-20260701";
+const SEASON_LABEL = "2026/27";
+const ESPN_DATES_RANGE = "20260801-20270701";
 
 /**
  * season start year untuk endpoint yang perlu param season numerik.
- * Diambil dari "YYYY/YY", contoh "2025/26" -> 2025
+ * Diambil dari "YYYY/YY", contoh "2026/27" -> 2026
  */
 function getSeasonStartYear() {
   const m = String(SEASON_LABEL).match(/^(\d{4})\s*[/\-]/);
   if (m) return parseInt(m[1], 10);
   const y = parseInt(String(SEASON_LABEL).trim(), 10);
-  return Number.isFinite(y) ? y : 2025;
+  return Number.isFinite(y) ? y : 2026;
 }
 
 /**

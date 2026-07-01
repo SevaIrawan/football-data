@@ -1,5 +1,5 @@
 /**
- * SCRIPT 1 — FETCH JADWAL MUSIM 2025/26 via ESPN API
+ * SCRIPT 1 — FETCH JADWAL via ESPN API (musim dari season.config.js)
  * ====================================================
  * Source: ESPN Hidden API (tanpa API key, gratis)
  * Output: Tulis ke Google Sheet mulai row 2
